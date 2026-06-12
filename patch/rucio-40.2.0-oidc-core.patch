@@ -1,8 +1,8 @@
 diff --git a/lib/rucio/core/oidc.py b/lib/rucio/core/oidc.py
-index c00388e84..db191d6fa 100644
+index c00388e84..1f083c7ff 100644
 --- a/lib/rucio/core/oidc.py
 +++ b/lib/rucio/core/oidc.py
-@@ -117,14 +117,35 @@ def _token_cache_set(key: str, value: str) -> None:
+@@ -117,12 +117,37 @@ def _token_cache_set(key: str, value: str) -> None:
      REGION.set(key, value)
 
 
@@ -16,8 +16,6 @@ index c00388e84..db191d6fa 100644
      Return ``None`` if the configuration was not loaded properly or the request
      was unsuccessful.
      """
--    if not all([OIDC_CLIENT_ID, OIDC_CLIENT_SECRET, OIDC_PROVIDER_ENDPOINT]):
--        if OIDC_CONFIGURATION_RUN or not __load_oidc_configuration():
 +    global CC_CLIENT_ID, CC_CLIENT_SECRET
 +
 +    # Load SCIM credentials once
@@ -37,10 +35,12 @@ index c00388e84..db191d6fa 100644
 +                CC_CLIENT_SECRET = scim_data["client_secret"]
 +        except Exception:
 +            logging.error('Failed to read or parse idpsecrets file "%s"', IDPSECRETS, exc_info=True)
++            return None
++
+     if not all([OIDC_CLIENT_ID, OIDC_CLIENT_SECRET, OIDC_PROVIDER_ENDPOINT]):
+         if OIDC_CONFIGURATION_RUN or not __load_oidc_configuration():
              return None
-
-     key = hashlib.md5(f'audience={audience};scope={scope}'.encode()).hexdigest()
-@@ -134,7 +155,7 @@ def request_token(audience: str, scope: str, use_cache: bool = True) -> Optional
+@@ -134,7 +159,7 @@ def request_token(audience: str, scope: str, use_cache: bool = True) -> Optional
 
      try:
          response = requests.post(url=OIDC_PROVIDER_ENDPOINT,
