@@ -1,14 +1,5 @@
-From 3cd3307d210a905a794f7cf932521c8767c5aa83 Mon Sep 17 00:00:00 2001
-From: Anil Panta <panta@jlab.org>
-Date: Wed, 11 Mar 2026 14:45:18 -0400
-Subject: [PATCH 1/2] Patch: fix postgres metadata plugin for Rucio 37.4.0
-
----
- .../core/did_meta_plugins/postgres_meta.py    | 142 +++++++++---------
- 1 file changed, 70 insertions(+), 72 deletions(-)
-
 diff --git a/lib/rucio/core/did_meta_plugins/postgres_meta.py b/lib/rucio/core/did_meta_plugins/postgres_meta.py
-index cbb77239b..df715ba07 100644
+index 5dd744163..46545866d 100644
 --- a/lib/rucio/core/did_meta_plugins/postgres_meta.py
 +++ b/lib/rucio/core/did_meta_plugins/postgres_meta.py
 @@ -19,6 +19,7 @@ from typing import TYPE_CHECKING
@@ -16,10 +7,10 @@ index cbb77239b..df715ba07 100644
  from psycopg import sql
  from psycopg.rows import dict_row
 +from psycopg_pool import ConnectionPool
-
+ 
  from rucio.common import config, exception
  from rucio.common.types import InternalScope
-@@ -72,23 +73,12 @@ class ExternalPostgresJSONDidMeta(DidMetaPlugin):
+@@ -72,23 +73,22 @@ class ExternalPostgresJSONDidMeta(DidMetaPlugin):
              'name': table_column_name
          }
          self.jsonb_column = table_column_data
@@ -39,16 +30,25 @@ index cbb77239b..df715ba07 100644
 -            sql.SQL("SET search_path TO {}").format(
 -                sql.Identifier(db_schema)
 -            )
--        )
--        cur.close()
 +
 +        # Set search_path in connection string - applied to all connections automatically
-+        conninfo = f"host={host} port={port} dbname={db} user={user} password={password} options='-c search_path={db_schema}'"
-+        self.pool = ConnectionPool(conninfo=conninfo, min_size=2, max_size=20)
-
++        conninfo = (
++            f"host={host} port={port} dbname={db} user={user} password={password} "
++            f"options='-c search_path={db_schema}' "
++            f"keepalives=1 keepalives_idle=30 keepalives_interval=10 keepalives_count=3"
++        )
++        self.pool = ConnectionPool(
++            conninfo=conninfo,
++            min_size=2,
++            max_size=20,
++            max_lifetime=3600,  # Recycle after 1 hour
++            max_idle=300        # Close if idle for 5 minutes
+         )
+-        cur.close()
+ 
          if not table_is_managed:                    # not managed by Rucio, so just verify table schema
              self._verify_table_schema(table_column_vo, table_column_scope, table_column_name, table_column_data)
-@@ -107,17 +97,18 @@ class ExternalPostgresJSONDidMeta(DidMetaPlugin):
+@@ -107,17 +107,18 @@ class ExternalPostgresJSONDidMeta(DidMetaPlugin):
              sql.SQL("scope varchar NOT NULL"),
              sql.SQL("name varchar NOT NULL"),
              sql.SQL("data jsonb DEFAULT '{}'::jsonb"),
@@ -61,7 +61,7 @@ index cbb77239b..df715ba07 100644
              sql.Identifier(self.table),
              sql.SQL(', ').join(table_clauses)
          )
-
+ 
 -        cur = self.client.cursor()
 -        cur.execute(statement)
 -        cur.close()
@@ -70,13 +70,13 @@ index cbb77239b..df715ba07 100644
 +            with conn.cursor() as cursor:
 +                cursor.execute(statement)
 +            conn.commit()
-
+ 
      def _verify_table_schema(self, table_column_vo, table_column_scope, table_column_name, table_column_data):
          """
-@@ -137,11 +128,32 @@ class ExternalPostgresJSONDidMeta(DidMetaPlugin):
+@@ -137,11 +138,32 @@ class ExternalPostgresJSONDidMeta(DidMetaPlugin):
              sql.Literal(self.table)
          )
-
+ 
 -        cur = self.client.cursor()
 -        cur.execute(statement)
 -        existing_table_columns = cur.fetchall()
@@ -99,21 +99,21 @@ index cbb77239b..df715ba07 100644
 +            ).format(
 +                sql.Literal(self.table)
 +            )
-
++
 +            with conn.cursor() as cursor:
 +                cursor.execute(statement)
 +                existing_table_constraints = cursor.fetchall()
-+
+ 
 +            conn.commit()
 +
 +        # Validate columns
          mandatory_column_specifications = [
              (table_column_vo, "character varying", "NO"),
              (table_column_scope, "character varying", "NO"),
-@@ -154,25 +166,7 @@ class ExternalPostgresJSONDidMeta(DidMetaPlugin):
+@@ -154,25 +176,7 @@ class ExternalPostgresJSONDidMeta(DidMetaPlugin):
                      "mandatory table column {} does not match that defined in the required table schema {}".format(
                          specification, existing_table_columns))
-
+ 
 -        # Check required table constraints exist.
 -        statement = sql.SQL(
 -            "SELECT con.contype AS constraint_type, "  # type: ignore
@@ -137,9 +137,9 @@ index cbb77239b..df715ba07 100644
          mandatory_table_constraints = [
              ("u", [table_column_scope, table_column_name]),  # unique scope+name table constraint
          ]
-@@ -183,14 +177,14 @@ class ExternalPostgresJSONDidMeta(DidMetaPlugin):
+@@ -183,14 +187,13 @@ class ExternalPostgresJSONDidMeta(DidMetaPlugin):
                          constraint, len(existing_table_constraints)))
-
+ 
      def _drop_metadata_table(self):
 -        cur = self.client.cursor()
 -        cur.execute(
@@ -156,14 +156,13 @@ index cbb77239b..df715ba07 100644
 +                        sql.Identifier(self.table)
 +                    )
 +                )
-+            conn.commit()
-
+ 
      def get_metadata(self, scope, name, *, session: "Optional[Session]" = None):
          """
-@@ -207,13 +201,14 @@ class ExternalPostgresJSONDidMeta(DidMetaPlugin):
+@@ -207,13 +210,13 @@ class ExternalPostgresJSONDidMeta(DidMetaPlugin):
              sql.Literal(name)
          )
-
+ 
 -        cur = self.client.cursor()
 -        cur.execute(statement)
 -        metadata = cur.fetchone()
@@ -172,18 +171,17 @@ index cbb77239b..df715ba07 100644
 +            with conn.cursor() as cursor:
 +                cursor.execute(statement)
 +                metadata = cursor.fetchone()
-+            conn.commit()
-
+ 
          if not metadata:
 -            raise exception.DataIdentifierNotFound("No metadata found for did '{}:{}".format(scope, name))
 +            raise exception.DataIdentifierNotFound("No metadata found for did '{}:{}'".format(scope, name))
-
+ 
          return metadata[0]
-
-@@ -253,10 +248,10 @@ class ExternalPostgresJSONDidMeta(DidMetaPlugin):
+ 
+@@ -253,10 +256,10 @@ class ExternalPostgresJSONDidMeta(DidMetaPlugin):
              sql.Identifier(self.table)
          )
-
+ 
 -        cur = self.client.cursor()
 -        cur.execute(statement)
 -        cur.close()
@@ -192,23 +190,13 @@ index cbb77239b..df715ba07 100644
 +            with conn.cursor() as cursor:
 +                cursor.execute(statement)
 +            conn.commit()
-
+ 
      def delete_metadata(self, scope, name, key, *, session: "Optional[Session]" = None):
          """
-@@ -267,16 +262,18 @@ class ExternalPostgresJSONDidMeta(DidMetaPlugin):
-         :param key: the key to be deleted
-         :param session: the database session in use
-         """
--        statement = sql.SQL("UPDATE {} SET data = {}.data - {}").format(
-+        statement = sql.SQL("UPDATE {} SET data = {}.data - {} WHERE scope = {} AND name = {}").format(
-             sql.Identifier(self.table),
-             sql.Identifier(self.table),
--            sql.Literal(key)
-+            sql.Literal(key),
-+            sql.Literal(scope.internal),
-+            sql.Literal(name)
+@@ -275,10 +278,10 @@ class ExternalPostgresJSONDidMeta(DidMetaPlugin):
+             sql.Literal(name)
          )
-
+ 
 -        cur = self.client.cursor()
 -        cur.execute(statement)
 -        cur.close()
@@ -217,87 +205,22 @@ index cbb77239b..df715ba07 100644
 +            with conn.cursor() as cursor:
 +                cursor.execute(statement)
 +            conn.commit()
-
+ 
      def list_dids(self, scope, filters, did_type='collection', ignore_case=False, limit=None,
                    offset=None, long=False, recursive=False, ignore_dids=None, *, session: "Optional[Session]" = None):
-@@ -315,10 +312,11 @@ class ExternalPostgresJSONDidMeta(DidMetaPlugin):
+@@ -318,11 +321,10 @@ class ExternalPostgresJSONDidMeta(DidMetaPlugin):
+             postgres_where_sql,
              sql.SQL("LIMIT {}").format(sql.Literal(limit)) if limit else sql.SQL("")
          )
-
+-
 -        cur = self.client.cursor(row_factory=dict_row)
--        cur.execute(statement)
+-        cur.execute(statement, filter_args)
 -        query_result = cur.fetchall()
 -        cur.close()
 +        with self.pool.connection() as conn:
 +            with conn.cursor(row_factory=dict_row) as cursor:
-+                cursor.execute(statement)
++                cursor.execute(statement, filter_args)
 +                query_result = cursor.fetchall()
-+            conn.commit()
-
+ 
          if long:
              for row in query_result:
---
-2.39.2 (Apple Git-143)
-
-
-From c52d46df7fbf4a6da3c2eeb65b1707ee361cf9e4 Mon Sep 17 00:00:00 2001
-From: Anil Panta <panta@jlab.org>
-Date: Thu, 12 Mar 2026 08:57:07 -0400
-Subject: [PATCH 2/2] Patch: fix postgres metadata plugin with add pool recycle
- for Rucio 37.4.0
-
----
- .../core/did_meta_plugins/postgres_meta.py      | 17 ++++++++++++-----
- 1 file changed, 12 insertions(+), 5 deletions(-)
-
-diff --git a/lib/rucio/core/did_meta_plugins/postgres_meta.py b/lib/rucio/core/did_meta_plugins/postgres_meta.py
-index df715ba07..71d4a1568 100644
---- a/lib/rucio/core/did_meta_plugins/postgres_meta.py
-+++ b/lib/rucio/core/did_meta_plugins/postgres_meta.py
-@@ -77,8 +77,18 @@ class ExternalPostgresJSONDidMeta(DidMetaPlugin):
-         self.table = table
-
-         # Set search_path in connection string - applied to all connections automatically
--        conninfo = f"host={host} port={port} dbname={db} user={user} password={password} options='-c search_path={db_schema}'"
--        self.pool = ConnectionPool(conninfo=conninfo, min_size=2, max_size=20)
-+        conninfo = (
-+            f"host={host} port={port} dbname={db} user={user} password={password} "
-+            f"options='-c search_path={db_schema}' "
-+            f"keepalives=1 keepalives_idle=30 keepalives_interval=10 keepalives_count=3"
-+        )
-+        self.pool = ConnectionPool(
-+            conninfo=conninfo,
-+            min_size=2,
-+            max_size=20,
-+            max_lifetime=3600,  # Recycle after 1 hour
-+            max_idle=300        # Close if idle for 5 minutes
-+        )
-
-         if not table_is_managed:                    # not managed by Rucio, so just verify table schema
-             self._verify_table_schema(table_column_vo, table_column_scope, table_column_name, table_column_data)
-@@ -184,7 +194,6 @@ class ExternalPostgresJSONDidMeta(DidMetaPlugin):
-                         sql.Identifier(self.table)
-                     )
-                 )
--            conn.commit()
-
-     def get_metadata(self, scope, name, *, session: "Optional[Session]" = None):
-         """
-@@ -205,7 +214,6 @@ class ExternalPostgresJSONDidMeta(DidMetaPlugin):
-             with conn.cursor() as cursor:
-                 cursor.execute(statement)
-                 metadata = cursor.fetchone()
--            conn.commit()
-
-         if not metadata:
-             raise exception.DataIdentifierNotFound("No metadata found for did '{}:{}'".format(scope, name))
-@@ -316,7 +324,6 @@ class ExternalPostgresJSONDidMeta(DidMetaPlugin):
-             with conn.cursor(row_factory=dict_row) as cursor:
-                 cursor.execute(statement)
-                 query_result = cursor.fetchall()
--            conn.commit()
-
-         if long:
-             for row in query_result:
---
-2.39.2 (Apple Git-143)

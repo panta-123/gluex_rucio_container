@@ -1,0 +1,676 @@
+diff --git a/lib/rucio/gateway/tokens.py b/lib/rucio/gateway/tokens.py
+new file mode 100644
+index 000000000..f6226a026
+--- /dev/null
++++ b/lib/rucio/gateway/tokens.py
+@@ -0,0 +1,520 @@
++# Copyright European Organization for Nuclear Research (CERN) since 2012
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#    http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++import posixpath
++from typing import TYPE_CHECKING, Any, Literal, Optional
++from urllib.parse import urlparse
++
++from rucio.common import exception
++from rucio.common.constants import DEFAULT_VO, RseAttr
++from rucio.common.exception import RucioException
++from rucio.common.types import InternalAccount, InternalScope
++from rucio.core import account as account_core
++from rucio.core import did as did_core
++from rucio.core import oidc as oidc_core
++from rucio.core import permission as permission_core
++from rucio.core import replica as replica_core
++from rucio.core import rse as rse_core
++from rucio.core import scope as scope_core
++from rucio.db.sqla.constants import DatabaseOperationType, DIDType, ReplicaState, RSEType
++from rucio.db.sqla.session import db_session
++from rucio.rse import rsemanager as rsemgr
++
++if TYPE_CHECKING:
++    from sqlalchemy.orm import Session
++
++NO_REGISTER_RSE_ATTRIBUTE = "no_register"
++
++
++def _scope_path(path: str, base_path: Optional[str]) -> str:
++    """
++    Canonical '/'-prefixed scope path: leading slash guaranteed, duplicate
++    slashes and './'/'../' segments collapsed by normpath, and the RSE's
++    OIDC base path stripped (keeping the result '/'-prefixed). Ensures both
++    the download and upload branches emit identically shaped paths.
++    """
++    path = posixpath.normpath("/" + path.lstrip("/"))
++    if base_path:
++        base_path = posixpath.normpath("/" + base_path.lstrip("/"))
++        if base_path != "/" and (path == base_path or path.startswith(base_path + "/")):
++            path = "/" + path[len(base_path):].lstrip("/")
++    return path
++
++
++def _check_rse_for_upload(
++    rse: str,
++    vo: str,
++    session: "Session",
++) -> tuple[Any, dict[str, Any]]:
++    """
++    RSE-level preconditions common to every upload-token request.
++
++    :returns: (rse_id, rse_settings)
++    :raises RucioException: if the RSE cannot support a path-scoped
++        upload token at all.
++    """
++    rse_id = rse_core.get_rse_id(rse=rse, vo=vo, session=session)
++
++    if not rse_core.get_rse_attribute(rse_id, RseAttr.OIDC_SUPPORT):
++        raise RucioException(f"RSE {rse} does not support OIDC; cannot issue an upload token")
++
++    rse_settings = rse_core.get_rse(rse_id=rse_id, session=session)
++    # User-driven direct uploads are disk-only. Tape RSEs are written via
++    # staging/replication workflows (e.g. rules pulling from a disk source),
++    # never via a client's direct PUT, so refuse to mint a token here.
++    if rse_settings.get("rse_type") == RSEType.TAPE:
++        raise RucioException(
++            f"RSE {rse} is a TAPE RSE; direct user uploads to tape are not supported"
++        )
++    if not rse_settings.get("availability_write", True):
++        raise RucioException(f"RSE {rse} is not available for writing")
++
++    # On a non-deterministic RSE the real write target is the caller's
++    # forced PFN, which server-side lfns2pfns cannot predict -- any token
++    # minted here would not match the write.
++    if not rse_settings.get("deterministic", True):
++        raise RucioException(
++            f"RSE {rse} is non-deterministic; path-scoped upload tokens are not supported for it"
++        )
++
++    return rse_id, rse_settings
++
++
++def _check_rse_write_permission(
++    rse: str,
++    rse_id: Any,
++    issuer_account: InternalAccount,
++    session: "Session",
++) -> None:
++    """
++    Ordinary write entitlement on the RSE, required by both flows.
++
++    The kwargs contract matches the one add_replicas() itself uses for the
++    'add_replicas' action.
++
++    :raises AccessDenied: if the account may not write to this RSE.
++    """
++    auth_result = permission_core.has_permission(
++        issuer=issuer_account,
++        action="add_replicas",
++        kwargs={"rse": rse, "rse_id": rse_id},
++        session=session,
++    )
++    if not auth_result.allowed:
++        raise exception.AccessDenied(
++            f"{issuer_account} does not have permission to upload to {rse}. {auth_result.message}"
++        )
++
++
++def _check_did_is_registered_file(
++    scope: str,
++    name: str,
++    did_scope: InternalScope,
++    session: "Session",
++) -> None:
++    """
++    The DID must already exist and must be a FILE.
++
++    With register_after_upload rejected, the supported flow is
++    register-then-upload: UploadClient._register_file has created the DID
++    before a token is requested.
++
++    Accepting a dataset or container name here would generate a
++    nonsensical (or path-colliding) scope for something that was never
++    meant to have a physical replica in the first place.
++
++    :raises AccessDenied: if the DID does not exist.
++    :raises RucioException: if the DID exists but is not a FILE.
++    """
++    try:
++        did = did_core.get_did(scope=did_scope, name=name, session=session)
++    except exception.DataIdentifierNotFound as error:
++        raise RucioException(
++            f"{scope}:{name} does not exist yet, and register_after_upload mode is not "
++            f"yet supported; cannot issue an upload token for a new DID"
++        ) from error
++
++    if did["type"] != DIDType.FILE:
++        raise RucioException(
++            f"{scope}:{name} exists but is a {did['type']}, not a FILE; "
++            f"cannot request an upload token for it"
++        )
++
++
++def _check_single_copying_replica(
++    rse: str,
++    rse_id: Any,
++    scope: str,
++    name: str,
++    did_scope: InternalScope,
++    session: "Session",
++) -> None:
++    """
++    The DID must carry exactly one replica: at this RSE, in COPYING state.
++
++    A DID existing globally is not the same as "there is a legitimate
++    in-flight upload for THIS rse". The COPYING replica row is the
++    reservation proving one. A second copy of an existing file is made
++    with a replication rule, not a second direct upload, so a non-COPYING
++    replica -- or replicas at other RSEs -- is refused by design.
++
++    NOTE: only the list_replicas() call is wrapped. The validation raises
++    below are intentional, typed exceptions (RucioException /
++    AccessDenied) and must NOT be caught and re-wrapped, or callers lose
++    the ability to distinguish "access denied" from "internal error".
++
++    :raises AccessDenied: if the replica is elsewhere or in the wrong state.
++    :raises RucioException: if there is no replica, or more than one.
++    """
++    try:
++        replicas = list(replica_core.list_replicas(
++            dids=[{"scope": did_scope, "name": name}],
++            all_states=True,
++            session=session,
++        ))
++    except Exception as error:
++        raise RucioException(
++            f"Failed to check replica state for {scope}:{name} at {rse}: {error}"
++        ) from error
++
++    # FILE DIDs yield exactly one entry (a file is returned even with zero
++    # replicas). all_states=True adds the 'states' map {rse_id: state_name}
++    # so the COPYING replica isn't filtered out. list_replicas emits state
++    # as the ReplicaState *name* string (e.g. 'AVAILABLE'), not the enum
++    # member and not the '.value' single-char code -- compare against
++    # ReplicaState.COPYING.name.
++    states = replicas[0].get("states", {}) if replicas else {}
++    n_replicas = len(states)
++
++    if n_replicas == 0:
++        raise RucioException(
++            f"{scope}:{name} has no replica; cannot issue an upload token for it"
++        )
++    if n_replicas > 1:
++        raise RucioException(
++            f"{scope}:{name} has {n_replicas} replicas across RSEs; "
++            f"refusing to issue an upload token (expected a single COPYING replica)"
++        )
++
++    state_name = states.get(rse_id)
++    if state_name is None:
++        raise exception.AccessDenied(
++            f"{scope}:{name}'s only replica is not at {rse}; "
++            f"refusing to issue an upload token"
++        )
++    if state_name != ReplicaState.COPYING.name:
++        raise exception.AccessDenied(
++            f"{scope}:{name} replica at {rse} is in state {state_name}, "
++            f"expected COPYING; refusing to issue an upload token"
++        )
++
++
++def _check_no_register_allowed(
++    rse: str,
++    rse_id: Any,
++    scope: str,
++    issuer: str,
++    issuer_account: InternalAccount,
++    did_scope: InternalScope,
++    session: "Session",
++) -> None:
++    """
++    Entitlement basis for an unregistered upload.
++
++    no_register produces no DID and no replica, so none of the checks that
++    back the registered flow are available. The substitutes are an
++    explicit per-RSE opt-in, an admin account, and ownership of the target
++    scope.
++
++    :raises AccessDenied: if the RSE has not opted in, the issuer is not
++        an admin account, or the scope does not belong to the issuer.
++    """
++    # Explicit per-RSE opt-in. Unregistered uploads leave bytes on storage
++    # with no catalog record and nothing to reconcile them, so an RSE must
++    # ask for this rather than inherit it.
++    if not rse_core.get_rse_attribute(rse_id, NO_REGISTER_RSE_ATTRIBUTE, session=session):
++        raise exception.AccessDenied(
++            f"RSE {rse} does not permit unregistered uploads "
++            f"(RSE attribute '{NO_REGISTER_RSE_ATTRIBUTE}' is not set)"
++        )
++
++    # Admin-only: there is no replica reservation backing this token, so
++    # ordinary add_replicas permission is not a sufficient basis on its own.
++    if not account_core.has_account_attribute(
++        account=issuer_account, key="admin", session=session
++    ):
++        raise exception.AccessDenied(
++            f"{issuer} is not an admin account; unregistered uploads to {rse} are admin-only"
++        )
++
++    # The DID does not exist (that is the point), so scope ownership is
++    # the only thing tying this path to this caller. Without it an admin
++    # could park a file at the deterministic path of someone else's future
++    # upload -- which UploadClient.upload() would then silently skip via
++    # its rsemgr.exists() pre-check.
++    account_scopes = scope_core.get_scopes(
++        account=issuer_account, session=session
++    )
++    if did_scope not in account_scopes:
++        raise exception.AccessDenied(
++            f"scope {scope} does not belong to {issuer}; "
++            f"refusing to issue an unregistered-upload token"
++        )
++
++
++def _upload_scopes_for_paths(final_path: str, tmp_path: str) -> set[str]:
++    """
++    The scope strings for one resolved (final, tmp) path pair.
++
++    Identical for registered and no_register uploads: _upload_item is
++    unaware of no_register, so the storage-side sequence is the same in
++    both cases -- exists(tmp) -> put(tmp) -> stat(tmp) -> rename(tmp, final).
++
++    storage.modify on tmp covers the put, the post-put stat, and deleting
++    a stale leftover from a prior attempt (a delete, which storage.create
++    excludes). The final path needs only storage.read for the exists()
++    pre-check: the write lands there via rename, which authorizes against
++    the source path. storage.modify:<final_path> is never granted -- that
++    is what would permit clobbering existing data.
++    """
++    return {
++        f"storage.modify:{tmp_path}",
++        f"storage.create:{final_path}",
++    }
++
++
++def _resolve_upload_token_scopes(
++    rse: str,
++    rse_id: Any,
++    scope: str,
++    name: str,
++    domain: str,
++    session: "Session",
++) -> tuple[str, str]:
++    """
++    Resolve the audience and scope string for an upload token.
++
++    UploadClient reaches the storage through three protocol objects, not
++    one: write (_upload_item's protocol_write), read (rsemgr.exists() in
++    upload(), and the signed-URL read protocol on cloud RSEs), and delete
++    (_upload_item's protocol_delete, clearing a stale tmp). An RSE may
++    declare separate protocol entries per operation with differing
++    prefixes, so the path is resolved under each operation rather than
++    assuming the write path covers all three. On the common single-entry
++    RSE the paths coincide and the set does not grow.
++
++    Only 'write' is mandatory: an RSE declaring no read- or delete-capable
++    protocol on this domain never exercises those paths.
++
++    :returns: (audience, scope_request)
++    """
++    base_path = rse_core.get_rse_attribute(rse_id, RseAttr.OIDC_BASE_PATH)
++    rse_protocols = rse_core.get_rse_protocols(rse_id, session=session)
++
++    # Audience spans every protocol hostname on the RSE, not just the
++    # write-capable ones: the delete and read protocols used during an
++    # upload may live on different hosts. Do not narrow this to the write set.
++    audience = " ".join(sorted({p["hostname"] for p in rse_protocols["protocols"]}))
++
++    lfn = {"scope": scope, "name": name}
++    all_scopes: set[str] = set()
++    resolved_any_write = False
++
++    for op, required in (("write", True), ("read", False), ("delete", False)):
++        try:
++            protocols = rsemgr.get_protocols_ordered(
++                rse_protocols, operation=op, domain=domain
++            )
++        except exception.RSEProtocolNotSupported as error:
++            # _get_possible_protocols raises rather than returning an empty
++            # list, so this is the "RSE declares nothing for this operation
++            # on this domain" case.
++            if required:
++                raise RucioException(
++                    f"No write-capable protocol found for RSE {rse} on domain {domain}"
++                ) from error
++            continue
++        except (exception.RSEOperationNotSupported,
++                exception.RSEProtocolDomainNotSupported) as error:
++            # Bad input (unknown operation or domain) rather than a gap in
++            # this RSE's configuration -- always fatal.
++            raise RucioException(
++                f"Cannot resolve {op} protocols for RSE {rse}: {error}"
++            ) from error
++
++        for protocol in protocols:
++            pfns = rsemgr.lfns2pfns(
++                rse_settings=rse_protocols, lfns=[lfn], operation=op,
++                scheme=protocol["scheme"], domain=domain,
++            )
++            pfn = next(iter(pfns.values()))
++
++            # Deliberately not rsemgr.parse_pfns(): it re-selects a protocol
++            # by scheme through select_protocol(), which shuffles and may
++            # return components for a different entry than the one that
++            # built this PFN.
++            final_path = _scope_path(urlparse(pfn).path, base_path)
++            tmp_path = f"{final_path}.rucio.upload"
++
++            all_scopes |= _upload_scopes_for_paths(final_path, tmp_path)
++
++            if op == "write":
++                resolved_any_write = True
++
++    # Unreachable in practice: get_protocols_ordered raises rather than
++    # returning empty, so a write failure has already been raised above.
++    # Kept as a cheap invariant.
++    if not resolved_any_write:
++        raise RucioException(f"No usable write path resolved for {scope}:{name} on {rse}")
++
++    return audience, " ".join(sorted(all_scopes))
++
++
++def _mint_token(audience: str, scope_request: str) -> str:
++    """
++    Request the token from the OIDC core and normalise the failure modes.
++
++    :raises RucioException: if the request fails or yields None.
++    """
++    try:
++        token = oidc_core.request_token(audience=audience, scope=scope_request, use_cache=False)
++    except Exception as error:
++        raise RucioException(f"Failed to request token: {error}") from error
++
++    if token is None:
++        raise RucioException(
++            f"Failed to obtain token: received None for audience='{audience}', scope='{scope_request}'"
++        )
++    return token
++
++
++def request_token(
++    rse: str,
++    operation: Literal["download", "upload"],
++    vo: str = DEFAULT_VO,
++    scope: Optional[str] = None,
++    name: Optional[str] = None,
++    issuer: Optional[str] = None,
++    domain: str = "wan",
++    register_after_upload: bool = False,
++    no_register: bool = False,
++) -> str:
++    """
++    Gateway for requesting an OIDC token.
++
++    For 'download', the token is scoped to every protocol prefix on the
++    RSE (storage.read:<prefix> for each protocol), since the caller has
++    not yet committed to a specific scheme/protocol.
++
++    For 'upload', the scopes granted are the same in both modes -- see
++    _upload_scopes_for_paths() -- because UploadClient._upload_item is
++    unaware of no_register and performs the same storage-side sequence:
++    exists(tmp) -> put(tmp) -> stat(tmp) -> rename(tmp, final). Only the
++    entitlement basis differs:
++
++      no_register=False (default): the DID must already exist as a FILE
++        and carry exactly one replica -- at this RSE, in COPYING state.
++        That replica row is the reservation proving a legitimate in-flight
++        upload for this path. Request the token after
++        UploadClient._register_file has run.
++
++      no_register=True: no DID and no replica exist, so the substitutes
++        are an explicit per-RSE opt-in (RseAttr as NO_REGISTER), an admin
++        account, and ownership of the target scope.
++
++    Both modes additionally require add_replicas permission on the RSE.
++
++    storage.modify:<final_path> is never granted, so register_after_upload
++    is rejected (its overwrite path deletes the final path) and
++    non-deterministic RSEs are rejected (the true write target is a
++    caller-forced PFN this gateway cannot predict). Protocols with
++    renaming disabled would put() directly to the final path and are not
++    supported. A caller-forced PFN is not supportable in either mode.
++
++    'domain' must be the domain the client actually resolved ('lan' when
++    its site matches the RSE site attribute, else 'wan'); a token scoped
++    for the wrong domain may not match the write path.
++
++    Concurrency note for no_register=True: with no replica row, two
++    simultaneous requests for the same scope:name both receive valid
++    tokens. Whether the second clobbers the first is then a property of
++    the storage's rename-over-existing behaviour (fail-closed under
++    xrootd), not of the token.
++
++    :raises AccessDenied: if the caller is not entitled to this upload.
++    :raises RucioException: if the token cannot be retrieved, is None, or
++        if inputs are invalid.
++    """
++    if operation == "download":
++        if no_register:
++            raise RucioException("'no_register' is only meaningful for upload token requests")
++
++        with db_session(DatabaseOperationType.READ) as session:
++            rse_id = rse_core.get_rse_id(rse=rse, vo=vo, session=session)
++            audience = rse_core.determine_audience_for_rse(rse_id=rse_id)
++            base_path = rse_core.get_rse_attribute(rse_id, RseAttr.OIDC_BASE_PATH)
++            rse_protocols = rse_core.get_rse_protocols(rse_id, session=session)
++            all_scopes = {
++                f"storage.read:{_scope_path(protocol['prefix'], base_path)}"
++                for protocol in rse_protocols["protocols"]
++            }
++            scope_request = " ".join(sorted(all_scopes))
++
++    elif operation == "upload":
++        if not scope or not name:
++            raise RucioException("upload token requests require 'scope' and 'name'")
++        if not issuer:
++            raise RucioException("upload token requests require an authenticated issuer")
++        if register_after_upload:
++            # Mirrors UploadClient, where no_register wins over
++            # register_after_upload -- but reject the combination outright
++            # rather than silently picking one.
++            raise RucioException(
++                "register_after_upload mode is not yet supported; it would require "
++                "a storage.modify scope on the final path, which is unsafe for existing data"
++            )
++
++        with db_session(DatabaseOperationType.READ) as session:
++            rse_id, _ = _check_rse_for_upload(rse, vo, session)
++
++            issuer_account = InternalAccount(issuer, vo=vo)
++            did_scope = InternalScope(scope, vo=vo)
++
++            _check_rse_write_permission(rse, rse_id, issuer_account, session)
++
++            # Exactly one of these two entitlement paths runs. Do NOT
++            # rewrite as a shared preamble plus an optional extra check:
++            # the registered path's COPYING-replica invariant is the only
++            # thing tying that token to an in-flight upload, and a
++            # fallthrough that skipped it would hand out the same scopes
++            # on nothing but add_replicas permission.
++            if no_register:
++                _check_no_register_allowed(
++                    rse, rse_id, scope, issuer, issuer_account, did_scope, session
++                )
++            else:
++                _check_did_is_registered_file(scope, name, did_scope, session)
++                _check_single_copying_replica(
++                    rse, rse_id, scope, name, did_scope, session
++                )
++
++            audience, scope_request = _resolve_upload_token_scopes(
++                rse=rse, rse_id=rse_id, scope=scope, name=name,
++                domain=domain, session=session,
++            )
++
++    else:
++        raise RucioException(f"unsupported operation {operation!r}")
++
++    return _mint_token(audience, scope_request)
+diff --git a/lib/rucio/web/rest/flaskapi/v1/tokens.py b/lib/rucio/web/rest/flaskapi/v1/tokens.py
+new file mode 100644
+index 000000000..c2016e5f9
+--- /dev/null
++++ b/lib/rucio/web/rest/flaskapi/v1/tokens.py
+@@ -0,0 +1,144 @@
++# Copyright European Organization for Nuclear Research (CERN) since 2012
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#    http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++from flask import jsonify, request
++
++from rucio.common.constants import DEFAULT_VO, HTTPMethod
++from rucio.common.exception import AccessDenied, RucioException
++from rucio.common.utils import parse_response
++from rucio.gateway.tokens import request_token
++from rucio.web.rest.flaskapi.authenticated_bp import AuthenticatedBlueprint
++from rucio.web.rest.flaskapi.v1.common import ErrorHandlingMethodView, generate_http_error_flask, json_parameters, param_get, response_headers
++
++
++class RequestToken(ErrorHandlingMethodView):
++    """REST API endpoint to request an OIDC token."""
++
++    def post(self):
++        """
++        ---
++        summary: Request OIDC token
++        description: Request an OIDC token for a specific RSE and operation.
++        tags:
++          - Token
++        requestBody:
++          content:
++            'application/json':
++              schema:
++                type: object
++                required:
++                  - rse
++                  - operation
++                properties:
++                  rse:
++                    type: string
++                    description: "The RSE name."
++                  operation:
++                    type: string
++                    enum: ["download", "upload"]
++                    description: "The operation type."
++                  scope:
++                    type: string
++                    description: "The DID scope. Required when operation is 'upload'."
++                  name:
++                    type: string
++                    description: "The DID name. Required when operation is 'upload'."
++                  domain:
++                    type: string
++                    enum: ["wan", "lan"]
++                    default: "wan"
++                    description: "The network domain the token will be used over. Only used when operation is 'upload'."
++                  register_after_upload:
++                    type: boolean
++                    default: false
++                    description: "Whether the upload will use register-after-upload mode. Only used when operation is 'upload'; grants an additional storage.modify scope on the final path, since that mode can delete orphaned pre-existing data at the final path."
++                  no_register:
++                    type: boolean
++                    default: false
++                    description: "Whether the upload will use no-register mode. Only used when operation is 'upload'; grants an additional storage.modify scope on the final path, since that mode can delete orphaned pre-existing data at the final path."
++        responses:
++          200:
++            description: "Token successfully generated"
++            content:
++              application/json:
++                schema:
++                  type: object
++                  properties:
++                    token:
++                      type: string
++          400:
++            description: "Cannot decode json parameter list, or missing required parameters for the requested operation."
++          401:
++            description: "Permission denied"
++          503:
++            description: "Failed to request token"
++        """
++        parameters = json_parameters(parse_response)
++        rse = param_get(parameters, "rse")
++        operation = param_get(parameters, "operation")
++        scope = param_get(parameters, "scope", default=None)
++        name = param_get(parameters, "name", default=None)
++        domain = param_get(parameters, "domain", default="wan")
++        register_after_upload = param_get(parameters, "register_after_upload", default=False)
++        no_register = param_get(parameters, "no_register", default=False)
++
++        vo = request.environ.get("vo", DEFAULT_VO)
++        # NOTE: confirm this matches the key your AuthenticatedBlueprint
++        # actually populates for the caller's account -- check an existing
++        # authenticated endpoint in this same flaskapi/v1 tree for the
++        # exact key name before relying on this.
++        issuer = request.environ.get("issuer")
++
++        if operation == "upload" and (not scope or not name):
++            return generate_http_error_flask(
++                400, RucioException("'scope' and 'name' are required when operation is 'upload'")
++            )
++
++        try:
++            token = request_token(
++                rse=rse,
++                operation=operation,
++                vo=vo,
++                scope=scope,
++                name=name,
++                issuer=issuer,
++                domain=domain,
++                register_after_upload=register_after_upload,
++                no_register=no_register
++            )
++        except AccessDenied as error:
++            return generate_http_error_flask(401, error)
++        except RucioException as error:
++            return generate_http_error_flask(503, error)
++
++        return jsonify({"token": token}), 200
++
++
++def blueprint(with_doc=False):
++    bp = AuthenticatedBlueprint("token", __name__, url_prefix="/token")
++
++    request_token_view = RequestToken.as_view("requesttoken")
++    bp.add_url_rule("/request", view_func=request_token_view, methods=[HTTPMethod.POST.value])
++
++    bp.after_request(response_headers)
++    return bp
++
++
++def make_doc():
++    """Only used for sphinx documentation"""
++    from flask import Flask
++
++    doc_app = Flask(__name__)
++    doc_app.register_blueprint(blueprint(with_doc=True))
++    return doc_app

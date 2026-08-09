@@ -1,0 +1,330 @@
+diff --git a/lib/rucio/client/credentialclient.py b/lib/rucio/client/credentialclient.py
+index 8e8bdd6f1..e68770165 100644
+--- a/lib/rucio/client/credentialclient.py
++++ b/lib/rucio/client/credentialclient.py
+@@ -12,6 +12,9 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
++import json
++from typing import Any, Literal, Optional
++
+ from requests.status_codes import codes
+ 
+ from rucio.client.baseclient import BaseClient, choice
+@@ -31,6 +34,7 @@ class CredentialClient(BaseClient):
+     """
+ 
+     CREDENTIAL_BASEURL = 'credentials'
++    TOKEN_BASEURL = 'token'
+ 
+     def get_signed_url(
+             self,
+@@ -108,3 +112,94 @@ class CredentialClient(BaseClient):
+ 
+         exc_cls, exc_msg = self._get_exception(headers=r.headers, status_code=r.status_code, data=r.content)
+         raise exc_cls(exc_msg)
++
++    def _post_token_request(self, data: dict[str, Any]) -> str:
++        """Send a sesson token request to the server and return the minted storage token."""
++        path = '/'.join([self.TOKEN_BASEURL, 'request'])
++        rurl = build_url(choice(self.list_hosts), path=path)
++        r = self._send_request(rurl, method=HTTPMethod.POST, data=json.dumps(data))
++        if r.status_code == codes.ok:
++            return json.loads(r.text)['token']
++        exc_cls, exc_msg = self._get_exception(headers=r.headers,
++                                            status_code=r.status_code,
++                                            data=r.content)
++        raise exc_cls(exc_msg)
++
++
++    def get_upload_token(
++        self,
++        rse: str,
++        scope: str,
++        name: str,
++        domain: Literal["wan", "lan"] = "wan",
++        register_after_upload: bool = False,
++        no_register: bool = False,
++    ) -> str:
++        """
++        Request a file-scoped OIDC token for uploading a single DID to an RSE.
++
++        The token authorizes writing exactly the ``scope:name`` DID on ``rse``.
++        Call it only after the DID is registered — the server refuses tokens for
++        unregistered DIDs.
++
++        Parameters
++        ----------
++        rse
++            The name of the RSE to upload to.
++        scope
++            DID scope of the file to upload.
++        name
++            DID name of the file to upload.
++        domain
++            Network domain the token applies to: ``"wan"`` or ``"lan"``.
++            Defaults to ``"wan"``.
++        register_after_upload
++            Whether the file is registered after the upload completes.
++            Defaults to ``False``.
++        no_register
++            Whether to skip registration entirely. Defaults to ``False``.
++
++        Returns
++        -------
++        str
++            The OIDC access token, valid until it expires.
++
++        Raises
++        ------
++        RucioException
++            If the server returns a status code other than ``200 OK``,
++            including when the DID is not yet registered.
++        """
++        return self._post_token_request({
++            'rse': rse,
++            'operation': 'upload',
++            'scope': scope,
++            'name': name,
++            'domain': domain,
++            'register_after_upload': register_after_upload,
++            'no_register': no_register,
++        })
++
++    def get_download_token(self, rse: str) -> str:
++        """
++        Request an RSE-scoped OIDC token for downloading from an RSE.
++
++        The token authorises reading from ``rse`` and is not tied to a specific
++        DID, so a single token can serve many files on that RSE.
++
++        Parameters
++        ----------
++        rse
++            The name of the RSE to download from.
++
++        Returns
++        -------
++        str
++            The OIDC access token, valid until it expires.
++
++        Raises
++        ------
++        RucioException
++            If the server returns a status code other than ``200 OK``.
++        """
++        return self._post_token_request({'rse': rse, 'operation': 'download'})
+diff --git a/lib/rucio/client/uploadclient.py b/lib/rucio/client/uploadclient.py
+index 3ca6a0688..f31fea711 100644
+--- a/lib/rucio/client/uploadclient.py
++++ b/lib/rucio/client/uploadclient.py
+@@ -91,10 +91,6 @@ class UploadClient:
+ 
+         self.client: Final[Client] = _client if _client else Client()
+         self.client_location = detect_client_location()
+-        # if token should be used, use only JWT tokens
+-        self.auth_token: Optional[str] = (
+-            self.client.auth_token if len(self.client.auth_token.split(".")) == 3 else None
+-        )
+         self.tracing = tracing
+         if not self.tracing:
+             logger(logging.DEBUG, 'Tracing is turned off.')
+@@ -438,6 +434,30 @@ class UploadClient:
+                                     ignore_availability=ignore_availability,
+                                     activity=activity)
+ 
++            # Storage bearer for this file. Defaults to None, meaning "no bearer"
++            # (the protocol falls back to its own cert/x509 auth) -- never the
++            # Rucio session token. On an RSE flagged OIDC_SUPPORT we exchange the
++            # Rucio auth for a path-scoped storage token minted by the server.
++            # This request must happen after _register_file: the token API
++            # refuses tokens for unregistered DIDs. It is skipped for
++            # register_after_upload (DID not yet registered) and for explicit
++            # pfn uploads.
++            upload_auth_token = None
++            if rse_attributes.get(RseAttr.OIDC_SUPPORT) \
++                    and not register_after_upload and not pfn:
++                try:
++                    upload_auth_token = self.client.get_upload_token(
++                        rse, file['did_scope'], file['did_name'], domain=domain)
++                    logger(logging.DEBUG, 'Using scoped upload token for %s:%s at %s'
++                           % (file['did_scope'], file['did_name'], rse))
++                except Exception as error:
++                    # fall back to the RSE's other auth (e.g. x509) rather than failing the file.
++                    logger(logging.WARNING,
++                           'Could not obtain scoped upload token for %s:%s at %s, '
++                           'falling back to non-token auth: %s'
++                           % (file['did_scope'], file['did_name'], rse, str(error)))
++                    upload_auth_token = None
++
+             # if register_after_upload, the file should be overwritten if it is not registered,
+             # otherwise if the file already exists on RSE we're done
+             if register_after_upload:
+@@ -446,7 +466,7 @@ class UploadClient:
+                                  domain=domain,
+                                  scheme=force_scheme,
+                                  impl=impl,
+-                                 auth_token=self.auth_token,
++                                 auth_token=upload_auth_token,
+                                  vo=self.client.vo,
+                                  logger=logger):
+                     try:
+@@ -463,7 +483,7 @@ class UploadClient:
+                                  domain=domain,
+                                  scheme=force_scheme,
+                                  impl=impl,
+-                                 auth_token=self.auth_token,
++                                 auth_token=upload_auth_token,
+                                  vo=self.client.vo,
+                                  logger=logger):
+                     logger(logging.INFO,
+@@ -475,7 +495,7 @@ class UploadClient:
+                                    domain=domain,
+                                    scheme=force_scheme,
+                                    impl=impl,
+-                                   auth_token=self.auth_token,
++                                   auth_token=upload_auth_token,
+                                    vo=self.client.vo,
+                                    logger=logger):
+                     logger(logging.INFO, 'File already exists on RSE with different pfn. Skipping upload.')
+@@ -487,7 +507,7 @@ class UploadClient:
+                                  domain=domain,
+                                  scheme=force_scheme,
+                                  impl=impl,
+-                                 auth_token=self.auth_token,
++                                 auth_token=upload_auth_token,
+                                  vo=self.client.vo,
+                                  logger=logger):
+                     logger(logging.INFO, 'File already exists on RSE. Skipping upload')
+@@ -536,7 +556,8 @@ class UploadClient:
+                                             force_pfn=pfn,
+                                             transfer_timeout=file.get('transfer_timeout'),
+                                             delete_existing=delete_existing,
+-                                            sign_service=sign_service)
++                                            sign_service=sign_service,
++                                            auth_token=upload_auth_token)
+                     logger(logging.DEBUG, 'Upload done.')
+                     success = True
+                     file['upload_result'] = {0: True, 1: None, 'success': True, 'pfn': pfn}  # TODO: needs to be removed
+@@ -996,7 +1017,8 @@ class UploadClient:
+             force_scheme: Optional[str] = None,
+             transfer_timeout: Optional[int] = None,
+             delete_existing: bool = False,
+-            sign_service: Optional[str] = None
++            sign_service: Optional[str] = None,
++            auth_token: Optional[str] = None
+     ) -> Optional[str]:
+         """
+         Perform the actual file transfer to an RSE using the appropriate protocol.
+@@ -1034,6 +1056,10 @@ class UploadClient:
+             If True, removes any unregistered or stale file on the storage that matches this PFN.
+         sign_service
+             If set, requests a signed URL from the given service (e.g., gcs, s3, swift).
++        auth_token
++            The storage bearer token to use for this protocol, or None to use the
++            protocol's own (e.g. cert/x509) authentication. This is the per-file,
++            path-scoped storage token requested from the server
+ 
+         Returns
+         -------
+@@ -1059,7 +1085,8 @@ class UploadClient:
+                                                'write',
+                                                force_scheme=force_scheme,
+                                                domain=domain,
+-                                               impl=impl)
++                                               impl=impl,
++                                               auth_token=auth_token)
+ 
+         base_name = lfn.get('filename', lfn['name'])
+         name = lfn.get('name', base_name)
+@@ -1087,7 +1114,8 @@ class UploadClient:
+             protocol_read = self._create_protocol(rse_settings,
+                                                   'read',
+                                                   domain=domain,
+-                                                  impl=impl)
++                                                  impl=impl,
++                                                  auth_token=auth_token)
+             if pfn is not None:
+                 signed_read_pfn = self.client.get_signed_url(rse_settings['rse'], sign_service, 'read', pfn)
+                 pfn = self.client.get_signed_url(rse_settings['rse'], sign_service, 'write', pfn)
+@@ -1116,7 +1144,8 @@ class UploadClient:
+                                                         'delete',
+                                                         force_scheme=force_scheme,
+                                                         domain=domain,
+-                                                        impl=impl)
++                                                        impl=impl,
++                                                        auth_token=auth_token)
+                 delete_pfn = '%s.rucio.upload' % list(protocol_delete.lfns2pfns(make_valid_did(lfn)).values())[0]
+                 if sign_service:
+                     delete_pfn = self.client.get_signed_url(rse_settings['rse'], sign_service, 'delete', delete_pfn)
+@@ -1135,7 +1164,8 @@ class UploadClient:
+                                                         'delete',
+                                                         force_scheme=force_scheme,
+                                                         domain=domain,
+-                                                        impl=impl)
++                                                        impl=impl,
++                                                        auth_token=auth_token)
+                 delete_pfn = '%s' % list(protocol_delete.lfns2pfns(make_valid_did(lfn)).values())[0]
+                 if sign_service:
+                     delete_pfn = self.client.get_signed_url(rse_settings['rse'], sign_service, 'delete', delete_pfn)
+@@ -1258,7 +1288,8 @@ class UploadClient:
+             operation: str,
+             impl: Optional[str] = None,
+             force_scheme: Optional[str] = None,
+-            domain: str = 'wan'
++            domain: str = 'wan',
++            auth_token: Optional[str] = None
+     ) -> "RSEProtocol":
+         """
+         Creates and returns the protocol object for the requested RSE operation.
+@@ -1278,6 +1309,10 @@ class UploadClient:
+             If provided, forces the protocol to use this scheme.
+         domain
+             The network domain to be used, defaulting to 'wan'.
++        auth_token
++            The storage bearer token to use for this protocol, or None to use the
++            protocol's own (e.g. cert/x509) authentication. This is the per-file,
++            path-scoped storage token requested from the server
+ 
+         Returns
+         -------
+@@ -1296,7 +1331,7 @@ class UploadClient:
+                 scheme=force_scheme,
+                 domain=domain,
+                 impl=impl,
+-                auth_token=self.auth_token,
++                auth_token=auth_token,
+                 logger=self.logger
+             )
+             protocol.connect()
+@@ -1430,7 +1465,8 @@ class UploadClient:
+     def preferred_impl(
+             self,
+             rse_settings: "RSESettingsDict",
+-            domain: str
++            domain: str,
++            auth_token: Optional[str] = None
+     ) -> Optional[str]:
+         """
+         Select a suitable protocol implementation for read, write, and delete operations on
+@@ -1450,6 +1486,10 @@ class UploadClient:
+         domain
+             The network domain (e.g., 'lan' or 'wan') in which the protocol must support
+             all operations.
++        auth_token
++            The storage bearer token to use for this protocol, or None to use the
++            protocol's own (e.g. cert/x509) authentication. This is the per-file,
++            path-scoped storage token requested from the server
+ 
+         Returns
+         -------
+@@ -1497,7 +1537,7 @@ class UploadClient:
+                 continue
+             try:
+                 supported_protocol = rsemgr.create_protocol(rse_settings, 'write', domain=domain, impl=protocol['impl'],
+-                                                            auth_token=self.auth_token, logger=self.logger)
++                                                            auth_token=auth_token, logger=self.logger)
+                 supported_protocol.connect()
+             except Exception as error:
+                 self.logger(logging.DEBUG, 'Failed to create protocol "%s", exception: %s' % (protocol['impl'], error))
