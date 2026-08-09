@@ -1,5 +1,5 @@
 diff --git a/lib/rucio/client/credentialclient.py b/lib/rucio/client/credentialclient.py
-index 8e8bdd6f1..e68770165 100644
+index 8e8bdd6f1..e79981904 100644
 --- a/lib/rucio/client/credentialclient.py
 +++ b/lib/rucio/client/credentialclient.py
 @@ -12,6 +12,9 @@
@@ -16,7 +16,7 @@ index 8e8bdd6f1..e68770165 100644
      """
  
      CREDENTIAL_BASEURL = 'credentials'
-+    TOKEN_BASEURL = 'token'
++    TOKEN_BASEURL = 'tokens'
  
      def get_signed_url(
              self,

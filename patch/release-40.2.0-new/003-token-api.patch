@@ -526,10 +526,10 @@ index 000000000..f6226a026
 +    return _mint_token(audience, scope_request)
 diff --git a/lib/rucio/web/rest/flaskapi/v1/tokens.py b/lib/rucio/web/rest/flaskapi/v1/tokens.py
 new file mode 100644
-index 000000000..c2016e5f9
+index 000000000..d9d672b51
 --- /dev/null
 +++ b/lib/rucio/web/rest/flaskapi/v1/tokens.py
-@@ -0,0 +1,144 @@
+@@ -0,0 +1,140 @@
 +# Copyright European Organization for Nuclear Research (CERN) since 2012
 +#
 +# Licensed under the Apache License, Version 2.0 (the "License");
@@ -626,10 +626,6 @@ index 000000000..c2016e5f9
 +        no_register = param_get(parameters, "no_register", default=False)
 +
 +        vo = request.environ.get("vo", DEFAULT_VO)
-+        # NOTE: confirm this matches the key your AuthenticatedBlueprint
-+        # actually populates for the caller's account -- check an existing
-+        # authenticated endpoint in this same flaskapi/v1 tree for the
-+        # exact key name before relying on this.
 +        issuer = request.environ.get("issuer")
 +
 +        if operation == "upload" and (not scope or not name):
@@ -658,9 +654,9 @@ index 000000000..c2016e5f9
 +
 +
 +def blueprint(with_doc=False):
-+    bp = AuthenticatedBlueprint("token", __name__, url_prefix="/token")
++    bp = AuthenticatedBlueprint("tokens", __name__, url_prefix="/tokens")
 +
-+    request_token_view = RequestToken.as_view("requesttoken")
++    request_token_view = RequestToken.as_view("request_token")
 +    bp.add_url_rule("/request", view_func=request_token_view, methods=[HTTPMethod.POST.value])
 +
 +    bp.after_request(response_headers)
