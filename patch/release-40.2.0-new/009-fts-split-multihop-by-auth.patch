@@ -1,0 +1,40 @@
+--- a/lib/rucio/transfertool/fts3.py
++++ b/lib/rucio/transfertool/fts3.py
+@@ -965,23 +965,30 @@
+ 
+         sub_path = []
+         fts_hosts = []
++        use_tokens = None
+         for hop in transfer_path:
+             hosts = cls._pick_fts_servers(hop.src.rse, hop.dst.rse)
+-            if hosts:
+-                fts_hosts = hosts
+-                sub_path.append(hop)
+-            else:
++            if not hosts:
+                 break
++            # An FTS job is authenticated either with tokens or with X.509 as a
++            # whole. Stop the sub-path where the authentication mode changes, so
++            # that e.g. DISK->DISK (tokens) -> TAPE (X.509) is submitted as two
++            # jobs: the first hops now, the remaining hops once they are done.
++            hop_uses_tokens = _use_tokens(hop)
++            if use_tokens is None:
++                use_tokens = hop_uses_tokens
++            elif hop_uses_tokens != use_tokens:
++                break
++            fts_hosts = hosts
++            sub_path.append(hop)
+ 
+         if len(sub_path) < len(transfer_path):
+             logger(logging.INFO, 'FTS3Transfertool can only submit {} hops from {}'.format(len(sub_path), [str(hop) for hop in transfer_path]))
+ 
+         if sub_path:
+-            oidc_support = False
+-            if all(_use_tokens(t) for t in sub_path):
++            if use_tokens:
+                 logger(logging.DEBUG, 'OAuth2/OIDC available for transfer {}'.format([str(hop) for hop in sub_path]))
+-                oidc_support = True
+-            return sub_path, TransferToolBuilder(cls, external_host=fts_hosts[0], oidc_support=oidc_support, vo=vo)
++            return sub_path, TransferToolBuilder(cls, external_host=fts_hosts[0], oidc_support=bool(use_tokens), vo=vo)
+         else:
+             return [], None
